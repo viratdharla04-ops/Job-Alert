@@ -31,7 +31,7 @@ GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
 TO_ADDRESS = os.environ.get("TO_ADDRESS") or GMAIL_ADDRESS
 
 COUNTRY = "us"
-MAX_DAYS_OLD = 2          # look back window each run (daily cron)
+MAX_DAYS_OLD = 30         # look back window each run (widen if digests are empty)
 RESULTS_PER_PAGE = 50
 MIN_YEARS = 4
 MIN_SALARY_IF_UNDER_MIN_YEARS = 120000
@@ -84,9 +84,10 @@ def fetch_jobs_for_keyword(keyword, page=1):
     params = {
         "app_id": ADZUNA_APP_ID,
         "app_key": ADZUNA_APP_KEY,
-        # what_phrase = exact phrase match, much stricter than "what"
-        # (which loosely matches on individual words and pulls in noise)
-        "what_phrase": keyword,
+        # "what" does broader matching; noise is cut out separately by
+        # is_sap_relevant() below rather than by forcing an exact phrase,
+        # which was too narrow for a niche role like this.
+        "what": keyword,
         "results_per_page": RESULTS_PER_PAGE,
         "max_days_old": MAX_DAYS_OLD,
         "sort_by": "date",
