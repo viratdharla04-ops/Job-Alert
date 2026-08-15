@@ -1,256 +1,187 @@
 """
-SAP Security / GRC Consultant job alert bot.
+Reads LinkedIn and Indeed "Job Alert" emails out of a Gmail inbox via IMAP
+and extracts individual job postings from them.
 
-Pulls fresh postings from the Adzuna job API (free, legit, no ToS risk),
-filters them against experience/salary rules, dedupes against previously
-seen postings, and emails a digest.
+This is the compliant way to get LinkedIn/Indeed postings into the digest:
+neither platform offers a public search API, and scraping either one risks
+account/IP blocks (see README). Instead, YOU set up their native job-alert
+emails (free, built into both platforms) for your search terms, and this
+module parses those alert emails out of your inbox.
 
-Rule: include a job if
-  - it mentions 4+ years experience, OR
-  - it mentions less than 4 years AND advertises salary >= $120,000, OR
-  - years of experience can't be determined from the text (shown so
-    nothing potentially relevant is silently dropped; flagged clearly).
+Setup required (one-time, on your end):
+  1. On LinkedIn: run a job search with your target keywords/filters, then
+     turn on "Job alert" for that search (bell icon on the search results
+     page). Set frequency to daily.
+  2. On Indeed: run a job search, click "Get new jobs for this search by
+     email", set frequency to daily.
+  3. Make sure both alerts deliver to the same Gmail inbox this bot reads
+     (GMAIL_ADDRESS secret).
+  4. Gmail IMAP must be enabled: Gmail Settings -> "Forwarding and POP/IMAP"
+     -> Enable IMAP. It's on by default for most accounts.
+
+Parsing note: this extracts job title + link via pattern matching on the
+email HTML, which is best-effort (email templates can change over time).
+It intentionally does not try to extract salary/years-experience from
+these emails, since that data usually isn't in the alert digest itself —
+those jobs are shown with "Experience level not specified", same as any
+other posting where that data is missing, so the classify() rule still
+applies (see search.py).
 """
 
-import os
 import re
-import json
-import smtplib
-from datetime import datetime
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+import html
+import hashlib
+import imaplib
+import email as email_lib
+from email.header import decode_header
+from datetime import datetime, timedelta
 
-import requests
+IMAP_HOST = "imap.gmail.com"
 
-from email_alerts import fetch_alert_jobs
+# Sender patterns that identify each platform's alert emails.
+LINKEDIN_SENDER_HINTS = ["jobalerts-noreply@linkedin.com", "@linkedin.com"]
+INDEED_SENDER_HINTS = ["@indeed.com"]
 
-# ---- Config ----------------------------------------------------------
+# Link patterns that identify an actual job posting (vs. nav/footer links).
+LINKEDIN_JOB_LINK_RE = re.compile(r"linkedin\.com/[^\"'\s]*jobs/view", re.IGNORECASE)
+INDEED_JOB_LINK_RE = re.compile(
+    r"indeed\.com/[^\"'\s]*(?:rc/clk|viewjob)", re.IGNORECASE
+)
 
-ADZUNA_APP_ID = os.environ["ADZUNA_APP_ID"]
-ADZUNA_APP_KEY = os.environ["ADZUNA_APP_KEY"]
-GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-TO_ADDRESS = os.environ.get("TO_ADDRESS") or GMAIL_ADDRESS
+ANCHOR_RE = re.compile(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', re.IGNORECASE | re.DOTALL)
+TAG_RE = re.compile(r"<[^>]+>")
 
-COUNTRY = "us"
-MAX_DAYS_OLD = 30         # look back window each run (widen if digests are empty)
-RESULTS_PER_PAGE = 50
-MIN_YEARS = 4
-MIN_SALARY_IF_UNDER_MIN_YEARS = 120000
-SEEN_FILE = "seen_jobs.json"
-
-KEYWORDS = [
-    "SAP Security Consultant",
-    "SAP GRC Consultant",
-    "SAP GRC Analyst",
-    "SAP Security Analyst",
-    "SAP Authorization",
-    "SAP Access Control",
-    "SAP IAM",
-    "S/4HANA Security",
-    "SAP Segregation of Duties",
-    "SAP Fiori Security",
-]
-
-# ---- Helpers -----------------------------------------------------------
-
-YEARS_RE = re.compile(
-    r"(\d{1,2})\s*\+?\s*(?:years?|yrs?)\b(?:\s+of)?(?:\s+experience)?",
+# Boilerplate link text to ignore (nav links, not real job titles).
+JUNK_TITLE_PATTERNS = re.compile(
+    r"^(view job|apply now|see more|unsubscribe|manage alerts|view all|"
+    r"see all|job alert|search again|update preferences)\b",
     re.IGNORECASE,
 )
 
 
-def extract_min_years(text: str):
-    """Return the smallest 'N years' figure mentioned, or None if none found."""
-    if not text:
-        return None
-    matches = [int(m) for m in YEARS_RE.findall(text)]
-    matches = [m for m in matches if 0 < m <= 25]  # sanity filter
-    return min(matches) if matches else None
+def _clean_text(raw_html_fragment: str) -> str:
+    text = TAG_RE.sub("", raw_html_fragment)
+    text = html.unescape(text)
+    return " ".join(text.split()).strip()
 
 
-def load_seen():
-    if os.path.exists(SEEN_FILE):
-        with open(SEEN_FILE, "r") as f:
-            return set(json.load(f))
-    return set()
+def _decode_subject(raw_subject):
+    if not raw_subject:
+        return ""
+    parts = decode_header(raw_subject)
+    decoded = ""
+    for part, enc in parts:
+        if isinstance(part, bytes):
+            decoded += part.decode(enc or "utf-8", errors="ignore")
+        else:
+            decoded += part
+    return decoded
 
 
-def save_seen(seen_ids):
-    with open(SEEN_FILE, "w") as f:
-        json.dump(sorted(seen_ids), f)
+def _get_html_body(msg):
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() == "text/html":
+                payload = part.get_payload(decode=True)
+                if payload:
+                    charset = part.get_content_charset() or "utf-8"
+                    return payload.decode(charset, errors="ignore")
+        return ""
+    if msg.get_content_type() == "text/html":
+        payload = msg.get_payload(decode=True)
+        if payload:
+            charset = msg.get_content_charset() or "utf-8"
+            return payload.decode(charset, errors="ignore")
+    return ""
 
 
-def fetch_jobs_for_keyword(keyword, page=1):
-    url = f"https://api.adzuna.com/v1/api/jobs/{COUNTRY}/search/{page}"
-    params = {
-        "app_id": ADZUNA_APP_ID,
-        "app_key": ADZUNA_APP_KEY,
-        # "what" does broader matching; noise is cut out separately by
-        # is_sap_relevant() below rather than by forcing an exact phrase,
-        # which was too narrow for a niche role like this.
-        "what": keyword,
-        "results_per_page": RESULTS_PER_PAGE,
-        "max_days_old": MAX_DAYS_OLD,
-        "sort_by": "date",
-    }
-    resp = requests.get(url, params=params, timeout=30)
-    resp.raise_for_status()
-    return resp.json().get("results", [])
-
-
-def is_sap_relevant(job):
-    """Hard filter: the posting must actually be about SAP, not just
-    coincidentally match a loose keyword search. Skipped for jobs sourced
-    from LinkedIn/Indeed alert emails, since those already came from the
-    person's own configured alert search terms."""
-    if job.get("source") in ("LinkedIn", "Indeed"):
-        return True
-    text = " ".join(
-        filter(None, [job.get("title", ""), job.get("description", "")])
-    ).lower()
-    if "sap" not in text:
-        return False
-    security_terms = [
-        "security", "grc", "authorization", "access control",
-        "segregation of duties", "sod", "iam", "identity and access",
-        "fiori security", "compliance",
-    ]
-    return any(term in text for term in security_terms)
-
-
-def classify(job):
-    """Return (include: bool, reason: str) for a job dict from Adzuna."""
-    text = " ".join(
-        filter(None, [job.get("title", ""), job.get("description", "")])
-    )
-    min_years = extract_min_years(text)
-    salary_min = job.get("salary_min")
-    salary_max = job.get("salary_max")
-    best_salary = max([v for v in (salary_min, salary_max) if v], default=None)
-
-    if min_years is None:
-        return True, "Experience level not specified in posting"
-    if min_years >= MIN_YEARS:
-        return True, f"{min_years}+ yrs experience listed"
-    if best_salary and best_salary >= MIN_SALARY_IF_UNDER_MIN_YEARS:
-        return True, f"{min_years} yrs required, but salary ~${best_salary:,.0f}"
-    return False, "Under 4 yrs and salary below $120K or unlisted"
-
-
-def build_email_html(matches):
-    if not matches:
-        return None
-    rows = []
-    for job, reason in matches:
-        title = job.get("title", "Untitled role")
-        company = (job.get("company") or {}).get("display_name", "Unknown company")
-        location = (job.get("location") or {}).get("display_name", "Unspecified")
-        url = job.get("redirect_url", "#")
-        contract_time = job.get("contract_time", "")
-        contract_type = job.get("contract_type", "")
-        salary_min = job.get("salary_min")
-        salary_max = job.get("salary_max")
-        salary_str = ""
-        if salary_min or salary_max:
-            lo = f"${salary_min:,.0f}" if salary_min else "?"
-            hi = f"${salary_max:,.0f}" if salary_max else "?"
-            salary_str = f"{lo} - {hi}"
-        rows.append(f"""
-        <tr style="border-bottom:1px solid #e5e5e5;">
-          <td style="padding:10px 8px;">
-            <a href="{url}" style="font-weight:600;color:#0b5fff;text-decoration:none;">{title}</a><br>
-            <span style="color:#555;">{company} &middot; {location}</span><br>
-            <span style="color:#888;font-size:12px;">
-              {contract_time} {contract_type} {'&middot; ' + salary_str if salary_str else ''}
-              &middot; Source: {job.get('source', 'Adzuna')}
-            </span><br>
-            <span style="color:#0a8a3c;font-size:12px;">Why shown: {reason}</span>
-          </td>
-        </tr>
-        """)
-    return f"""
-    <html><body style="font-family:Arial,sans-serif;">
-    <h2>SAP Security / GRC Job Digest — {datetime.now().strftime('%b %d, %Y')}</h2>
-    <p>{len(matches)} new matching posting(s):</p>
-    <table style="border-collapse:collapse;width:100%;max-width:700px;">
-    {''.join(rows)}
-    </table>
-    </body></html>
-    """
-
-
-def send_email(html_body, count):
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"SAP Security/GRC Job Alert — {count} new match(es)"
-    msg["From"] = GMAIL_ADDRESS
-    msg["To"] = TO_ADDRESS
-    msg.attach(MIMEText(html_body, "html"))
-
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-        server.login(GMAIL_ADDRESS, GMAIL_APP_PASSWORD)
-        server.sendmail(GMAIL_ADDRESS, TO_ADDRESS, msg.as_string())
-
-
-# ---- Main ---------------------------------------------------------------
-
-def main():
-    seen = load_seen()
-    matches = []
-    all_ids_this_run = set()
-
-    # --- Adzuna (broad aggregator) ---
-    for kw in KEYWORDS:
-        try:
-            jobs = fetch_jobs_for_keyword(kw)
-        except requests.RequestException as e:
-            print(f"[warn] fetch failed for '{kw}': {e}")
+def _extract_jobs_from_html(body_html, job_link_re, source_label):
+    jobs = []
+    for href, inner_html in ANCHOR_RE.findall(body_html):
+        href_unescaped = html.unescape(href)
+        if not job_link_re.search(href_unescaped):
             continue
-
-        for job in jobs:
-            job_id = str(job.get("id"))
-            if not job_id or job_id in seen or job_id in all_ids_this_run:
-                continue
-            all_ids_this_run.add(job_id)
-
-            if not is_sap_relevant(job):
-                continue
-
-            include, reason = classify(job)
-            if include:
-                matches.append((job, reason))
-
-    # --- LinkedIn / Indeed via native job-alert emails ---
-    try:
-        email_jobs = fetch_alert_jobs(
-            GMAIL_ADDRESS, GMAIL_APP_PASSWORD, since_days=MAX_DAYS_OLD
+        title = _clean_text(inner_html)
+        if not title or len(title) < 4 or JUNK_TITLE_PATTERNS.match(title):
+            continue
+        job_id = "email-" + hashlib.sha256(href_unescaped.encode()).hexdigest()[:16]
+        jobs.append(
+            {
+                "id": job_id,
+                "title": title,
+                "description": "",  # not reliably available from alert emails
+                "company": {"display_name": "See posting"},
+                "location": {"display_name": "See posting"},
+                "redirect_url": href_unescaped,
+                "contract_time": "",
+                "contract_type": "",
+                "salary_min": None,
+                "salary_max": None,
+                "source": source_label,
+            }
         )
-    except Exception as e:
-        print(f"[warn] email alert fetch failed: {e}")
-        email_jobs = []
-
-    for job in email_jobs:
-        job_id = str(job.get("id"))
-        if not job_id or job_id in seen or job_id in all_ids_this_run:
+    # de-dupe within this single email (same job often linked twice)
+    seen_urls = set()
+    unique = []
+    for job in jobs:
+        if job["redirect_url"] in seen_urls:
             continue
-        all_ids_this_run.add(job_id)
-
-        if not is_sap_relevant(job):
-            continue
-
-        include, reason = classify(job)
-        if include:
-            matches.append((job, reason))
-
-    if matches:
-        html = build_email_html(matches)
-        send_email(html, len(matches))
-        print(f"Sent digest with {len(matches)} matching job(s).")
-    else:
-        print("No new matching jobs this run.")
-
-    save_seen(seen | all_ids_this_run)
+        seen_urls.add(job["redirect_url"])
+        unique.append(job)
+    return unique
 
 
-if __name__ == "__main__":
-    main()
+def fetch_alert_jobs(gmail_address, gmail_app_password, since_days=2):
+    """Connect to Gmail via IMAP, find recent LinkedIn/Indeed job-alert
+    emails, and return a list of job dicts in the same shape used for
+    Adzuna results (so they can flow through the same classify() logic)."""
+    jobs = []
+    try:
+        imap = imaplib.IMAP4_SSL(IMAP_HOST)
+        imap.login(gmail_address, gmail_app_password)
+    except imaplib.IMAP4.error as e:
+        print(f"[warn] IMAP login failed, skipping email alerts: {e}")
+        return jobs
+
+    try:
+        imap.select("INBOX", readonly=True)
+        since_date = (datetime.now() - timedelta(days=since_days)).strftime(
+            "%d-%b-%Y"
+        )
+        status, data = imap.search(None, f'(SINCE "{since_date}")')
+        if status != "OK":
+            return jobs
+        msg_ids = data[0].split()
+
+        for msg_id in msg_ids:
+            status, msg_data = imap.fetch(msg_id, "(RFC822)")
+            if status != "OK" or not msg_data or not msg_data[0]:
+                continue
+            raw_email = msg_data[0][1]
+            msg = email_lib.message_from_bytes(raw_email)
+            from_addr = (msg.get("From") or "").lower()
+
+            is_linkedin = any(h in from_addr for h in LINKEDIN_SENDER_HINTS)
+            is_indeed = any(h in from_addr for h in INDEED_SENDER_HINTS)
+            if not (is_linkedin or is_indeed):
+                continue
+
+            body_html = _get_html_body(msg)
+            if not body_html:
+                continue
+
+            if is_linkedin:
+                jobs.extend(
+                    _extract_jobs_from_html(body_html, LINKEDIN_JOB_LINK_RE, "LinkedIn")
+                )
+            elif is_indeed:
+                jobs.extend(
+                    _extract_jobs_from_html(body_html, INDEED_JOB_LINK_RE, "Indeed")
+                )
+    finally:
+        try:
+            imap.logout()
+        except Exception:
+            pass
+
+    return jobs
