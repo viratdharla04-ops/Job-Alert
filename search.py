@@ -28,7 +28,7 @@ ADZUNA_APP_ID = os.environ["ADZUNA_APP_ID"]
 ADZUNA_APP_KEY = os.environ["ADZUNA_APP_KEY"]
 GMAIL_ADDRESS = os.environ["GMAIL_ADDRESS"]
 GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
-TO_ADDRESS = os.environ.get("TO_ADDRESS", GMAIL_ADDRESS)
+TO_ADDRESS = os.environ.get("TO_ADDRESS") or GMAIL_ADDRESS
 
 COUNTRY = "us"
 MAX_DAYS_OLD = 2          # look back window each run (daily cron)
@@ -84,7 +84,9 @@ def fetch_jobs_for_keyword(keyword, page=1):
     params = {
         "app_id": ADZUNA_APP_ID,
         "app_key": ADZUNA_APP_KEY,
-        "what": keyword,
+        # what_phrase = exact phrase match, much stricter than "what"
+        # (which loosely matches on individual words and pulls in noise)
+        "what_phrase": keyword,
         "results_per_page": RESULTS_PER_PAGE,
         "max_days_old": MAX_DAYS_OLD,
         "sort_by": "date",
@@ -92,6 +94,22 @@ def fetch_jobs_for_keyword(keyword, page=1):
     resp = requests.get(url, params=params, timeout=30)
     resp.raise_for_status()
     return resp.json().get("results", [])
+
+
+def is_sap_relevant(job):
+    """Hard filter: the posting must actually be about SAP, not just
+    coincidentally match a loose keyword search."""
+    text = " ".join(
+        filter(None, [job.get("title", ""), job.get("description", "")])
+    ).lower()
+    if "sap" not in text:
+        return False
+    security_terms = [
+        "security", "grc", "authorization", "access control",
+        "segregation of duties", "sod", "iam", "identity and access",
+        "fiori security", "compliance",
+    ]
+    return any(term in text for term in security_terms)
 
 
 def classify(job):
@@ -185,6 +203,9 @@ def main():
             if not job_id or job_id in seen or job_id in all_ids_this_run:
                 continue
             all_ids_this_run.add(job_id)
+
+            if not is_sap_relevant(job):
+                continue
 
             include, reason = classify(job)
             if include:
