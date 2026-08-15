@@ -22,6 +22,8 @@ from email.mime.text import MIMEText
 
 import requests
 
+from email_alerts import fetch_alert_jobs
+
 # ---- Config ----------------------------------------------------------
 
 ADZUNA_APP_ID = os.environ["ADZUNA_APP_ID"]
@@ -99,7 +101,11 @@ def fetch_jobs_for_keyword(keyword, page=1):
 
 def is_sap_relevant(job):
     """Hard filter: the posting must actually be about SAP, not just
-    coincidentally match a loose keyword search."""
+    coincidentally match a loose keyword search. Skipped for jobs sourced
+    from LinkedIn/Indeed alert emails, since those already came from the
+    person's own configured alert search terms."""
+    if job.get("source") in ("LinkedIn", "Indeed"):
+        return True
     text = " ".join(
         filter(None, [job.get("title", ""), job.get("description", "")])
     ).lower()
@@ -157,6 +163,7 @@ def build_email_html(matches):
             <span style="color:#555;">{company} &middot; {location}</span><br>
             <span style="color:#888;font-size:12px;">
               {contract_time} {contract_type} {'&middot; ' + salary_str if salary_str else ''}
+              &middot; Source: {job.get('source', 'Adzuna')}
             </span><br>
             <span style="color:#0a8a3c;font-size:12px;">Why shown: {reason}</span>
           </td>
@@ -192,6 +199,7 @@ def main():
     matches = []
     all_ids_this_run = set()
 
+    # --- Adzuna (broad aggregator) ---
     for kw in KEYWORDS:
         try:
             jobs = fetch_jobs_for_keyword(kw)
@@ -211,6 +219,28 @@ def main():
             include, reason = classify(job)
             if include:
                 matches.append((job, reason))
+
+    # --- LinkedIn / Indeed via native job-alert emails ---
+    try:
+        email_jobs = fetch_alert_jobs(
+            GMAIL_ADDRESS, GMAIL_APP_PASSWORD, since_days=MAX_DAYS_OLD
+        )
+    except Exception as e:
+        print(f"[warn] email alert fetch failed: {e}")
+        email_jobs = []
+
+    for job in email_jobs:
+        job_id = str(job.get("id"))
+        if not job_id or job_id in seen or job_id in all_ids_this_run:
+            continue
+        all_ids_this_run.add(job_id)
+
+        if not is_sap_relevant(job):
+            continue
+
+        include, reason = classify(job)
+        if include:
+            matches.append((job, reason))
 
     if matches:
         html = build_email_html(matches)
